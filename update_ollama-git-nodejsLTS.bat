@@ -8,13 +8,20 @@ rem   - Git via winget
 rem   - Ollama via winget
 rem   - Portable Node.js LTS via official Node ZIP
 rem No admin rights required if run as the logged-in user.
+rem v2
 rem ============================================================
+
+if not defined LOCALAPPDATA (
+    set "FATAL=LOCALAPPDATA is not defined. This must run as a normal logged-in user."
+    goto :fatal
+)
 
 set "PROGRAMS=%LOCALAPPDATA%\Programs"
 set "GIT_DIR=%PROGRAMS%\Git"
 set "OLLAMA_DIR=%PROGRAMS%\Ollama"
 set "NODE_DIR=%PROGRAMS%\nodejs"
 set "WORK=%TEMP%\devtools-setup-%RANDOM%-%RANDOM%"
+set "PATH_PS1=%WORK%\add-user-path.ps1"
 set "FATAL="
 
 rem Detect OS architecture for Node portable ZIP.
@@ -33,11 +40,6 @@ echo Node architecture: %NODE_ARCH%
 echo ============================================================
 echo.
 
-if not defined LOCALAPPDATA (
-    set "FATAL=LOCALAPPDATA is not defined. This must run as a normal logged-in user."
-    goto :fatal
-)
-
 mkdir "%PROGRAMS%" 2>nul
 mkdir "%WORK%" 2>nul
 
@@ -45,6 +47,7 @@ call :need winget.exe "Windows Package Manager / winget" || goto :fatal
 call :need curl.exe "curl.exe" || goto :fatal
 call :need cscript.exe "Windows Script Host / cscript" || goto :fatal
 call :need certutil.exe "CertUtil" || goto :fatal
+call :need powershell.exe "Windows PowerShell" || goto :fatal
 
 where tar.exe >nul 2>&1
 if errorlevel 1 (
@@ -55,12 +58,16 @@ echo Updating winget source metadata...
 winget source update --name winget --accept-source-agreements >nul 2>&1
 
 call :winget_install_or_update "Git.Git" "%GIT_DIR%" "%GIT_DIR%\cmd\git.exe" || goto :fatal
+
+call :stop_ollama
 call :winget_install_or_update "Ollama.Ollama" "%OLLAMA_DIR%" "%OLLAMA_DIR%\ollama.exe" || goto :fatal
+call :start_ollama
 
 call :install_node_lts || goto :fatal
 
 echo.
 echo Updating user PATH...
+call :write_path_helper
 call :add_user_path "%GIT_DIR%\cmd" || goto :fatal
 call :add_user_path "%OLLAMA_DIR%" || goto :fatal
 call :add_user_path "%NODE_DIR%" || goto :fatal
@@ -80,7 +87,8 @@ where ollama.exe >nul 2>&1 && ollama --version
 
 echo.
 echo Done.
-echo Note: New processes may need sign-out/sign-in or restart to inherit the updated user PATH from Explorer.
+echo Note: The user PATH was broadcast to the system, so newly launched programs
+echo       will see it. Already-open terminals/apps keep their old PATH until restarted.
 echo.
 
 rmdir /s /q "%WORK%" 2>nul
@@ -96,6 +104,45 @@ if errorlevel 1 (
 exit /b 0
 
 
+:stop_ollama
+rem Stop any running Ollama server/tray app so the upgrade can replace files
+rem in place and so the new server (not the old in-memory one) starts afterward.
+echo.
+echo Stopping any running Ollama processes...
+
+rem Force-kill the server and the tray app so the upgrade replaces files in place.
+taskkill /F /IM ollama.exe >nul 2>&1
+taskkill /F /IM "ollama app.exe" >nul 2>&1
+
+rem Confirm nothing named ollama* is still running before continuing.
+set "OLLAMA_RUNNING="
+for /f "skip=1 delims=" %%P in ('tasklist /fi "imagename eq ollama.exe" /fo csv 2^>nul') do set "OLLAMA_RUNNING=1"
+for /f "skip=1 delims=" %%P in ('tasklist /fi "imagename eq ollama app.exe" /fo csv 2^>nul') do set "OLLAMA_RUNNING=1"
+
+if defined OLLAMA_RUNNING (
+    echo Ollama still appears to be running; retrying force-stop...
+    taskkill /F /IM ollama.exe >nul 2>&1
+    taskkill /F /IM "ollama app.exe" >nul 2>&1
+)
+
+echo Ollama stopped.
+exit /b 0
+
+
+:start_ollama
+rem Relaunch Ollama after the upgrade so the freshly installed server (not the
+rem old one we killed) is the one running. Prefer the tray app; fall back to
+rem a detached "ollama serve". Both are single-instance-safe to start.
+echo.
+echo Starting Ollama...
+if exist "%OLLAMA_DIR%\ollama app.exe" (
+    start "" "%OLLAMA_DIR%\ollama app.exe"
+) else if exist "%OLLAMA_DIR%\ollama.exe" (
+    start "Ollama" "%OLLAMA_DIR%\ollama.exe" serve
+)
+exit /b 0
+
+
 :winget_install_or_update
 set "PKG=%~1"
 set "LOC=%~2"
@@ -106,9 +153,9 @@ echo ============================================================
 echo Checking %PKG%
 echo ============================================================
 
-winget list --id "%PKG%" --exact --scope user --accept-source-agreements >nul 2>&1
+winget list --id "%PKG%" --exact --accept-source-agreements >nul 2>&1
 if not errorlevel 1 (
-    echo %PKG% found in user scope. Attempting upgrade...
+    echo %PKG% is installed. Attempting upgrade...
     winget upgrade ^
         --id "%PKG%" ^
         --exact ^
@@ -192,7 +239,7 @@ set "NODE_EXTRACT=%WORK%\node-extract"
 set "NODE_VERSION="
 
 echo Downloading Node.js release index...
-curl.exe -L --fail --silent --show-error -o "%INDEX_JSON%" "https://nodejs.org/dist/index.json"
+curl.exe -L --fail --silent --show-error --retry 3 --retry-delay 2 --retry-connrefused -o "%INDEX_JSON%" "https://nodejs.org/dist/index.json"
 if errorlevel 1 (
     set "FATAL=Failed to download Node.js release index."
     exit /b 1
@@ -201,7 +248,7 @@ if errorlevel 1 (
 > "%GET_LTS_JS%" echo var fso = new ActiveXObject("Scripting.FileSystemObject");
 >>"%GET_LTS_JS%" echo var arch = WScript.Arguments(1);
 >>"%GET_LTS_JS%" echo var txt = fso.OpenTextFile(WScript.Arguments(0), 1).ReadAll();
->>"%GET_LTS_JS%" echo var data = JSON.parse(txt);
+>>"%GET_LTS_JS%" echo var data = eval("(" + txt + ")");
 >>"%GET_LTS_JS%" echo for (var i = 0; i ^< data.length; i++) {
 >>"%GET_LTS_JS%" echo   var x = data[i];
 >>"%GET_LTS_JS%" echo   if (x.lts ^&^& x.files ^&^& x.files.join(",").indexOf(arch) ^>= 0) { WScript.Echo(x.version); WScript.Quit(0); }
@@ -234,13 +281,13 @@ echo   Current: %INSTALLED_NODE%
 echo   Target : %NODE_VERSION%
 echo   URL    : %NODE_URL%
 
-curl.exe -L --fail --silent --show-error -o "%NODE_ZIP%" "%NODE_URL%"
+curl.exe -L --fail --silent --show-error --retry 3 --retry-delay 2 --retry-connrefused -o "%NODE_ZIP%" "%NODE_URL%"
 if errorlevel 1 (
     set "FATAL=Failed to download Node.js ZIP."
     exit /b 1
 )
 
-curl.exe -L --fail --silent --show-error -o "%NODE_SHASUMS%" "%SHASUMS_URL%"
+curl.exe -L --fail --silent --show-error --retry 3 --retry-delay 2 --retry-connrefused -o "%NODE_SHASUMS%" "%SHASUMS_URL%"
 if errorlevel 1 (
     set "FATAL=Failed to download Node.js SHASUMS256.txt."
     exit /b 1
@@ -254,8 +301,10 @@ if not defined EXPECTED_HASH (
     exit /b 1
 )
 
+rem certutil prints a header line, then the hash on line 2, then a status line.
+rem Taking line 2 (skip=1) is locale-independent, unlike matching "hash"/"CertUtil".
 set "ACTUAL_HASH="
-for /f "tokens=* delims=" %%H in ('certutil.exe -hashfile "%NODE_ZIP%" SHA256 ^| findstr /r /v /i "hash CertUtil"') do (
+for /f "skip=1 delims=" %%H in ('certutil.exe -hashfile "%NODE_ZIP%" SHA256') do (
     if not defined ACTUAL_HASH set "ACTUAL_HASH=%%H"
 )
 set "ACTUAL_HASH=%ACTUAL_HASH: =%"
@@ -308,26 +357,32 @@ echo Node.js %NODE_VERSION% installed at %NODE_DIR%.
 exit /b 0
 
 
+:write_path_helper
+rem Generate the PowerShell PATH helper once. Using PowerShell (instead of the
+rem old WScript.Shell RegWrite) avoids the 2048-char truncation of long PATHs,
+rem and [Environment]::SetEnvironmentVariable(..,'User') broadcasts a
+rem WM_SETTINGCHANGE so new processes inherit the change without a sign-out.
+rem NOTE: these echo lines must stay at top level (not inside a ( ) block),
+rem because the PowerShell code contains parentheses that would otherwise be
+rem read by cmd as the end of the block.
+> "%PATH_PS1%" echo param([string]$Dir)
+>>"%PATH_PS1%" echo $ErrorActionPreference = 'Stop'
+>>"%PATH_PS1%" echo $cur = [Environment]::GetEnvironmentVariable('Path','User'); if (-not $cur) { $cur = '' }
+>>"%PATH_PS1%" echo function Norm([string]$s) { return ($s -replace '[\\/]+$','').ToLowerInvariant() }
+>>"%PATH_PS1%" echo $want = Norm $Dir
+>>"%PATH_PS1%" echo $has = $false
+>>"%PATH_PS1%" echo foreach ($p in $cur.Split(';')) { if ($p -ne '' -and (Norm $p) -eq $want) { $has = $true } }
+>>"%PATH_PS1%" echo if ($has) { Write-Host ('PATH already contains: ' + $Dir); exit 0 }
+>>"%PATH_PS1%" echo if ($cur -ne '') { $next = $cur.TrimEnd(';') + ';' + $Dir } else { $next = $Dir }
+>>"%PATH_PS1%" echo [Environment]::SetEnvironmentVariable('Path', $next, 'User')
+>>"%PATH_PS1%" echo Write-Host ('Added to user PATH: ' + $Dir)
+>>"%PATH_PS1%" echo exit 0
+exit /b 0
+
+
 :add_user_path
 set "ADD_PATH=%~1"
-set "ADD_PATH_JS=%WORK%\add-user-path.js"
-
-if not exist "%ADD_PATH_JS%" (
-    > "%ADD_PATH_JS%" echo var sh = new ActiveXObject("WScript.Shell");
-    >>"%ADD_PATH_JS%" echo var p = WScript.Arguments(0);
-    >>"%ADD_PATH_JS%" echo var key = "HKCU\\Environment\\Path";
-    >>"%ADD_PATH_JS%" echo var cur = "";
-    >>"%ADD_PATH_JS%" echo try { cur = sh.RegRead(key); } catch(e) { cur = ""; }
-    >>"%ADD_PATH_JS%" echo function norm(s) { return (s + "").replace(/[\\\/]+$/, "").toLowerCase(); }
-    >>"%ADD_PATH_JS%" echo var want = norm(p);
-    >>"%ADD_PATH_JS%" echo var parts = cur ? cur.split(";") : [];
-    >>"%ADD_PATH_JS%" echo for (var i = 0; i ^< parts.length; i++) { if (norm(parts[i]) == want) { WScript.Echo("PATH already contains: " + p); WScript.Quit(0); } }
-    >>"%ADD_PATH_JS%" echo var next = cur ? cur.replace(/;+$/, "") + ";" + p : p;
-    >>"%ADD_PATH_JS%" echo sh.RegWrite(key, next, "REG_EXPAND_SZ");
-    >>"%ADD_PATH_JS%" echo WScript.Echo("Added to user PATH: " + p);
-)
-
-cscript.exe //nologo "%ADD_PATH_JS%" "%ADD_PATH%"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%PATH_PS1%" "%ADD_PATH%"
 if errorlevel 1 (
     set "FATAL=Failed to update user PATH with: %ADD_PATH%"
     exit /b 1
