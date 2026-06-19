@@ -45,7 +45,6 @@ mkdir "%WORK%" 2>nul
 
 call :need winget.exe "Windows Package Manager / winget" || goto :fatal
 call :need curl.exe "curl.exe" || goto :fatal
-call :need cscript.exe "Windows Script Host / cscript" || goto :fatal
 call :need certutil.exe "CertUtil" || goto :fatal
 call :need powershell.exe "Windows PowerShell" || goto :fatal
 
@@ -232,7 +231,7 @@ echo Checking portable Node.js LTS
 echo ============================================================
 
 set "INDEX_JSON=%WORK%\node-index.json"
-set "GET_LTS_JS=%WORK%\get-node-lts.js"
+set "GET_LTS_PS1=%WORK%\get-node-lts.ps1"
 set "NODE_ZIP=%WORK%\node.zip"
 set "NODE_SHASUMS=%WORK%\SHASUMS256.txt"
 set "NODE_EXTRACT=%WORK%\node-extract"
@@ -245,17 +244,17 @@ if errorlevel 1 (
     exit /b 1
 )
 
-> "%GET_LTS_JS%" echo var fso = new ActiveXObject("Scripting.FileSystemObject");
->>"%GET_LTS_JS%" echo var arch = WScript.Arguments(1);
->>"%GET_LTS_JS%" echo var txt = fso.OpenTextFile(WScript.Arguments(0), 1).ReadAll();
->>"%GET_LTS_JS%" echo var data = eval("(" + txt + ")");
->>"%GET_LTS_JS%" echo for (var i = 0; i ^< data.length; i++) {
->>"%GET_LTS_JS%" echo   var x = data[i];
->>"%GET_LTS_JS%" echo   if (x.lts ^&^& x.files ^&^& x.files.join(",").indexOf(arch) ^>= 0) { WScript.Echo(x.version); WScript.Quit(0); }
->>"%GET_LTS_JS%" echo }
->>"%GET_LTS_JS%" echo WScript.Quit(1);
+rem Pick the newest LTS build that ships the target arch, using PowerShell's
+rem native JSON parser (ConvertFrom-Json) -- robust, unlike the legacy WSH
+rem JScript engine which has no JSON object. index.json is sorted newest-first,
+rem so the first LTS match is the latest. Lines stay at top level so the
+rem parentheses in the PowerShell code are not seen by cmd as block ends.
+> "%GET_LTS_PS1%" echo param([string]$IndexPath, [string]$Arch)
+>>"%GET_LTS_PS1%" echo $ErrorActionPreference = 'Stop'
+>>"%GET_LTS_PS1%" echo $data = Get-Content -Raw -LiteralPath $IndexPath ^| ConvertFrom-Json
+>>"%GET_LTS_PS1%" echo foreach ($x in $data) { if ($x.lts -and (($x.files -join ',').Contains($Arch))) { Write-Output $x.version; break } }
 
-for /f "usebackq delims=" %%V in (`cscript.exe //nologo "%GET_LTS_JS%" "%INDEX_JSON%" "%NODE_ARCH%"`) do set "NODE_VERSION=%%V"
+for /f "usebackq delims=" %%V in (`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%GET_LTS_PS1%" "%INDEX_JSON%" "%NODE_ARCH%"`) do set "NODE_VERSION=%%V"
 
 if not defined NODE_VERSION (
     set "FATAL=Could not determine latest Node.js LTS version for %NODE_ARCH%."
